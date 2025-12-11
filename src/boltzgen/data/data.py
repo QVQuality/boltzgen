@@ -907,7 +907,7 @@ class Structure(NumpySerializable):
         old_to_new = {old.item(): new for new, old in enumerate(atom_indices)}
         old_to_new_res = {old.item(): new for new, old in enumerate(res_indices)}
 
-        old_to_new_res_chain = {}
+        res_chain_map = {}
 
         for i in range(len(residues)):
             original_atom_range = np.arange(
@@ -966,8 +966,7 @@ class Structure(NumpySerializable):
             chain_start = orig_chain["res_idx"]
             chain_end = orig_chain["res_idx"] + orig_chain["res_num"]
             chain_res_indices = [r for r in res_indices if chain_start <= r < chain_end]
-            chain_res_indices -= orig_chain["res_idx"]
-            old_to_new_res_chain[i] = {
+            res_chain_map[i] = {
                 old.item(): new for new, old in enumerate(chain_res_indices)
             }
 
@@ -996,8 +995,8 @@ class Structure(NumpySerializable):
                     chain_atom_start = chain["atom_idx"]
                     chain_atom_end = chain["atom_idx"] + chain["atom_num"]
                     if chain_atom_start <= res["atom_idx"] < chain_atom_end:
-                        res_idx_item = residues[i]["res_idx"].item()
-                        residues[i]["res_idx"] = old_to_new_res_chain[chain_idx].get(
+                        res_idx_item = res_indices[i]
+                        residues[i]["res_idx"] = res_chain_map[chain_idx].get(
                             res_idx_item
                         )
 
@@ -1759,6 +1758,18 @@ def biotite_array_from_feat(feat):
         atom_pad_mask & atom_resolved_mask
     ].bool()
 
+    # add chain design mask
+    chain_design_mask = feat["chain_design_mask"].bool()
+    atom_chain_design_mask = (
+        (feat["atom_to_token"].float() @ chain_design_mask.unsqueeze(-1).float())
+        .bool()
+        .squeeze()
+    )
+    atom_array.add_annotation("is_chain_design", bool)
+    atom_array.is_chain_design = atom_chain_design_mask[
+        atom_pad_mask & atom_resolved_mask
+    ].bool()
+
     return atom_array
 
 
@@ -1926,7 +1937,7 @@ class DesignInfo(NumpySerializable):
             and len(info.res_structure_groups) == len(info.res_ss_types)
             and len(info.res_ss_types) == len(info.res_binding_type)
         ), (
-            "There must be a bug in the code. All residue level design info objects should have the same lenght."
+            "There must be a bug in the code. All residue level design info objects should have the same length."
         )
 
         if any(info.res_design_mask.astype(bool) & (info.res_structure_groups != 0)):

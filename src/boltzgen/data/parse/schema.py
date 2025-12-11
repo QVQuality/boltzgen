@@ -670,7 +670,7 @@ def parse_range(ranges, c_start=0, c_end=None):
         raise ValueError(msg)
 
     if c_end is not None and end > c_end - c_start:
-        msg = f"Specified end {ranges} is higher than the lenght of the chain."
+        msg = f"Specified end {ranges} is higher than the length of the chain."
         raise ValueError(msg)
     return indices
 
@@ -1688,6 +1688,7 @@ class YamlDesignParser:
 
         proximity_mask = np.ones(num_res)
         if include_proximity is not None:
+            proximity_mask = np.zeros(num_res)
             coords = np.array(
                 [
                     structure.atoms[r["atom_center"]]["coords"]
@@ -1725,7 +1726,7 @@ class YamlDesignParser:
                 distances = cdist(coords, queries)
                 dist_mask = distances < radius
                 dist_mask = dist_mask.sum(-1) > 0
-                proximity_mask *= dist_mask
+                proximity_mask += dist_mask
         include_mask *= proximity_mask
 
         # Build exclude mask
@@ -1953,14 +1954,14 @@ class YamlDesignParser:
                     else:
                         indices = parse_range(loop, c_start, c_end)
                         fss_type[indices] = const.ss_type_ids["LOOP"]
-                elif "helix" in chain:
+                if "helix" in chain:
                     helix = chain["helix"]
                     if helix == "all":
                         fss_type[c_start:c_end] = const.ss_type_ids["HELIX"]
                     else:
                         indices = parse_range(helix, c_start, c_end)
                         fss_type[indices] = const.ss_type_ids["HELIX"]
-                elif "sheet" in chain:
+                if "sheet" in chain:
                     sheet = chain["sheet"]
                     if sheet == "all":
                         fss_type[c_start:c_end] = const.ss_type_ids["SHEET"]
@@ -1970,7 +1971,7 @@ class YamlDesignParser:
 
         # Parse and apply design insertions
         if design_insertions is not None:
-            num_inserted = 0
+            num_inserted = defaultdict(int)
             for list_element in design_insertions:
                 insertion = list_element["insertion"]
                 if "id" not in insertion:
@@ -1981,7 +1982,7 @@ class YamlDesignParser:
                     raise ValueError(msg)
                 chain_id = insertion["id"]
                 res_index = insertion["res_index"] - 1  # 1 index input to 0 indexed
-                res_index += num_inserted
+                res_index += num_inserted[chain_id]
                 ss_insert_type = insertion.get("secondary_structure", "UNSPECIFIED")
 
                 # We add +1 because the parse_range function is usually used for indexing where we then convert the 1 based inputs to 0 indexing
@@ -1989,7 +1990,7 @@ class YamlDesignParser:
                 num_residues = parse_range(num_residues)
                 num_residues = np.random.choice(num_residues).item()
                 num_residues += 1
-                num_inserted += num_residues
+                num_inserted[chain_id] += num_residues
 
                 if chain_id not in structure.chains["name"]:
                     msg = f"Specified chain id {chain_id} not in file {path}."
