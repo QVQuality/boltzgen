@@ -1,3 +1,4 @@
+import json
 from boltzgen.utils.quiet import quiet_startup
 
 
@@ -224,7 +225,7 @@ class Filter(Task):
         if not metrics_override is None:
             for k in metrics_override:
                 if metrics_override[k] is None:
-                    del self.metrics[k]
+                    self.metrics.pop(k, None)
                 else:
                     self.metrics[k] = metrics_override[k]
 
@@ -284,12 +285,12 @@ class Filter(Task):
                     {
                         "feature": "GLY_fraction",
                         "lower_is_better": True,
-                        "threshold": 0.2,
+                        "threshold": 0.3,
                     },
                     {
                         "feature": "GLU_fraction",
                         "lower_is_better": True,
-                        "threshold": 0.2,
+                        "threshold": 0.3,
                     },
                     {
                         "feature": "LEU_fraction",
@@ -299,7 +300,7 @@ class Filter(Task):
                     {
                         "feature": "VAL_fraction",
                         "lower_is_better": True,
-                        "threshold": 0.2,
+                        "threshold": 0.3,
                     },
                 ]
             )
@@ -312,6 +313,7 @@ class Filter(Task):
         self.load_dataframe()
         self.reset_outdir()
         self.filter_df()
+        self.absolute_metrics()
         self.sort_df()
         self.optimize_diversity()
         self.write_outdir()
@@ -371,6 +373,7 @@ class Filter(Task):
             df["designfolding-filter_rmsd"] = df["designfolding-bb_rmsd"]
         if "min_design_to_target_pae" in df:
             df["neg_min_design_to_target_pae"] = -df["min_design_to_target_pae"]
+
         if "design_hydrophobicity" in df:
             df["neg_design_hydrophobicity"] = -df["design_hydrophobicity"]
         if "design_largest_hydrophobic_patch_refolded" in df:
@@ -378,6 +381,8 @@ class Filter(Task):
                 "design_largest_hydrophobic_patch_refolded"
             ]
         df["neg_min_interaction_pae"] = -df["min_interaction_pae"]
+        df["neg_filter_rmsd"] = -df["filter_rmsd"]
+        df["neg_filter_rmsd_design"] = -df["filter_rmsd_design"]
         df["has_x"] = df["designed_sequence"].str.contains("X")
         self.df = df
 
@@ -416,6 +421,61 @@ class Filter(Task):
                 f"Only {num_pass} designs pass filters. We highly recommend relaxing the thresholds."
             )
         print("\n")
+
+    def absolute_metrics(self):
+        norm_path = Path("src/boltzgen/resources/metrics_normalization.json")
+        if not norm_path.exists():
+            return
+
+        with norm_path.open("r") as f:
+            norm_stats = json.load(f)
+
+        for col, stats in norm_stats.items():
+            mean = stats["mean"]
+            std = stats["std"]
+            if col in self.df.columns:
+                self.df[col + "_z"] = (self.df[col] - mean) / std
+
+        importances = {
+            "affinity_probability_binary1": 1.5,
+            "design_iiptm": 1.0,
+            "design_ptm": 0.5,
+            "min_design_to_target_pae": -1.0,  # lower is better
+            "design_hydrophobicity": -0.125,  # lower is better
+            "design_largest_hydrophobic_patch_refolded": -0.15,  # lower is better
+            "delta_sasa_refolded": 0.25,
+            "plip_saltbridge_refolded": 0.25,
+            "plip_hbonds_refolded": 0.25,
+        }
+
+        self.df["absolute_score"] = 0.0
+        for base_col, weight in importances.items():
+            if base_col in self.df.columns:
+                norm_col = base_col + "_z"
+                self.df["absolute_score"] += weight * self.df[norm_col]
+        total_importance = sum(abs(w) for w in importances.values())
+        self.df["absolute_score"] /= total_importance
+
+        self.df["structure_confidence"] = 0.0
+        weight_sum = 0
+        for col in ["design_iiptm", "design_ptm", "min_design_to_target_pae"]:
+            weight = importances[col]
+            norm_col = col + "_z"
+            weight_sum += abs(weight)
+            self.df["structure_confidence"] += weight * self.df[norm_col]
+        self.df["structure_confidence"] /= weight_sum
+
+        for flt in self.filters:
+            feat = flt["feature"]
+            filter_col = f"pass_{feat}_filter"
+            if "fraction" in feat:
+                # If this is a "fraction" feature, meaning a res_type fraction filter, only apply the penalty if num_design > 8
+                mask_fail = (self.df["num_design"] > 8) & (self.df[filter_col] == False)
+            else:
+                mask_fail = self.df[filter_col] == False
+
+            self.df.loc[mask_fail, "absolute_score"] *= 0.1
+
 
     def sort_df(self):
         rank_df = pd.DataFrame(index=self.df.index)
@@ -583,6 +643,12 @@ class Filter(Task):
             heapq.heappush(heap, (-gain, i))
 
         buckets = np.zeros(len(self.size_buckets) + 1)
+        first = selected[0]
+        first_len = len(self.df_m["sequence"][first])
+        for idx, bucket_size in enumerate(self.size_buckets):
+            if first_len >= bucket_size["min"] and first_len < bucket_size["max"]:
+                buckets[idx] += 1
+                break
         for _ in tqdm(
             range(k - 1), desc="Performing lazy greedy diversity optimization."
         ):
@@ -634,6 +700,12 @@ class Filter(Task):
             "min_design_to_target_pae"
             if "min_design_to_target_pae" in self.df
             else "min_interaction_pae",
+            "design_ipsae_min"
+            if "design_ipsae_min" in self.df
+            else "design_iptm",
+            "design_to_target_ipsae"
+            if "design_to_target_ipsae" in self.df
+            else "design_iptm",
             "delta_sasa_refolded"
             if self.from_inverse_folded
             else "delta_sasa_original",
@@ -678,6 +750,14 @@ class Filter(Task):
             ),
             (
                 "num_design",
+                "design_ipsae_min" if "design_ipsae_min" in self.df else "design_iptm",
+            ),
+            (
+                "num_design",
+                "design_to_target_ipsae" if "design_to_target_ipsae" in self.df else "design_iptm",
+            ),
+            (
+                "num_design",
                 "design_iiptm" if "design_iiptm" in self.df else "design_iptm",
             ),
             (
@@ -708,6 +788,12 @@ class Filter(Task):
             if "design_to_target_iptm" in self.df
             else "design_iptm",
             "design_iptm",
+            "design_ipsae_min"
+            if "design_ipsae_min" in self.df
+            else "design_iptm",
+            "design_to_target_ipsae"
+            if "design_to_target_ipsae" in self.df
+            else "design_iptm",
             "min_design_to_target_pae"
             if "min_design_to_target_pae" in self.df
             else "min_interaction_pae",
@@ -727,6 +813,12 @@ class Filter(Task):
 
         hist_metrics = list(dict.fromkeys(hist_metrics))
         extra_pairs = list(dict.fromkeys(extra_pairs))
+
+        # Prepend any active ranking metrics not already in the lists
+        extra_ranking = [m for m in self.metrics if m in self.df.columns and m not in hist_metrics]
+        hist_metrics = extra_ranking + hist_metrics
+        summary_metrics = extra_ranking + summary_metrics
+        extra_pairs = [("num_design", m) for m in extra_ranking] + extra_pairs
 
         if self.use_affinity:
             summary_metrics.insert(2, "affinity_probability_binary1")
@@ -818,6 +910,14 @@ class Filter(Task):
                 "same as design_iptm but for multi-chain designs",
             ],
             [
+                "design_ipsae_min",
+                "min interaction pSAE: PAE-based confidence score for interaction (higher = better)",
+            ],
+            [
+                "design_to_target_ipsae",
+                "interaction pSAE between design and target (higher = better)",
+            ],
+            [
                 "min_design_to_target_pae",
                 "minimum PAE between design & target (lower = better)",
             ],
@@ -853,7 +953,6 @@ class Filter(Task):
     ):
         pdf_path = self.outdir / f"results_overview.pdf"
         pdf = PdfPages(pdf_path)
-
 
         def _ensure_width(fig, target_w=8.5):
             w, h = fig.get_size_inches()
@@ -1201,8 +1300,6 @@ class Filter(Task):
                 continue
 
         pdf.close()
-
-
 
         print(
             "A description of metrics and summarizing plots was written to:", pdf_path
