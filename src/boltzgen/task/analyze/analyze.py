@@ -1,21 +1,18 @@
-from boltzgen.utils.quiet import quiet_startup
-
-
-quiet_startup()
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from concurrent.futures.process import BrokenProcessPool
-import copy
-import multiprocessing
-import numbers
-from pathlib import Path
-import traceback
-from typing import Optional, Dict, Any, List
-import subprocess
-import re
-import json
-
+from boltzgen.data.write.mmcif import to_mmcif
+from boltzgen.data.data import Structure
+from boltzgen.task.task import Task
+from boltzgen.data import const
+from collections import defaultdict
+from tqdm import tqdm
+import pandas as pd
+import numpy as np
+import torch
+from boltzgen.task.predict.data_from_generated import FromGeneratedDataModule
+import rdkit
+import pydssp
+import matplotlib as mpl
+from matplotlib import pyplot as plt
 from boltzgen.task.analyze.analyze_utils import (
-    TARGET_ID_RE,
     calc_hydrophobicity,
     compute_liability_metrics,
     compute_novelty_foldseek,
@@ -33,24 +30,24 @@ from boltzgen.task.analyze.analyze_utils import (
     vendi_scores,
     vendi_sequences,
 )
-from matplotlib import pyplot as plt
-import matplotlib as mpl
+import json
+import re
+import subprocess
+from typing import Optional, Dict, Any, List
+import traceback
+from pathlib import Path
+import numbers
+import multiprocessing
+import copy
+from concurrent.futures.process import BrokenProcessPool
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from boltzgen.utils.quiet import quiet_startup
+
+
+quiet_startup()
+
 
 mpl.rcParams["figure.max_open_warning"] = 100
-import pydssp
-import rdkit
-from boltzgen.task.predict.data_from_generated import FromGeneratedDataModule
-
-import torch
-import numpy as np
-import pandas as pd
-from tqdm import tqdm
-from collections import defaultdict
-
-from boltzgen.data import const
-from boltzgen.task.task import Task
-from boltzgen.data.data import Structure
-from boltzgen.data.write.mmcif import to_mmcif
 
 
 class Analyze(Task):
@@ -171,6 +168,10 @@ class Analyze(Task):
             raise ValueError(msg)
 
         self.bindsite_adherence_thresholds = [3, 4, 5, 6, 7, 8, 9]
+
+    def extract_target_id(self, sample_id: str) -> str:
+        match = re.search(rf"{self.data.cfg.target_id_regex}", sample_id)
+        return match.group(1) if match else sample_id
 
     def init_datasets(self, design_dir: str, load_dataset: bool = False):
         self.design_dir = Path(design_dir)
@@ -385,7 +386,7 @@ class Analyze(Task):
         )
 
         # Compute per target metrics
-        df["target_id"] = df["id"].apply(lambda s: TARGET_ID_RE.match(s).group(1))
+        df["target_id"] = df["id"].apply(self.extract_target_id)
         per_target_df = df.groupby("target_id").mean(numeric_only=True).reset_index()
         csv_path = Path(self.design_dir) / f"per_target_metrics_{self.name}.csv"
         per_target_df.to_csv(csv_path, float_format="%.5f", index=False)
@@ -596,12 +597,11 @@ class Analyze(Task):
                 metrics[f"designed_sequence_{chain_id}"] = design_seq
                 metrics[f"full_sequence_{chain_id}"] = full_chain_seq
 
-
-        target_id = re.search(rf"{self.data.cfg.target_id_regex}", sample_id).group(1)
+        target_id = self.extract_target_id(sample_id)
 
         # Get masks
         design_mask = feat["design_mask"].bool()
-        chain_design_mask   = feat["chain_design_mask"].bool() 
+        chain_design_mask = feat["chain_design_mask"].bool()
 
         design_resolved_mask = design_mask & feat["token_resolved_mask"].bool()
 
@@ -803,21 +803,6 @@ class Analyze(Task):
         metrics["native_rmsd"] = 0.0
         metrics["native_rmsd_bb"] = 0.0
         if self.native:
-            target_coords = feat["coords"][:, atom_target_resolved_mask]
-            native_target_coords = feat["native_coords"][
-                :, native_atom_target_resolved_mask
-            ]
-            target_rmsd = compute_rmsd(native_target_coords, target_coords)
-
-            bb_target_coords = feat["coords"][
-                :, atom_target_resolved_mask & feat["backbone_mask"].bool()
-            ]
-            bb_native_target_coords = feat["native_coords"][
-                :,
-                native_atom_target_resolved_mask & feat["native_backbone_mask"].bool(),
-            ]
-            bb_target_rmsd = compute_rmsd(bb_native_target_coords, bb_target_coords)
-
             bb_coords = feat["coords"][:, feat["backbone_mask"].bool()]
             bb_native_coords = feat["native_coords"][
                 :, feat["native_backbone_mask"].bool()
@@ -825,8 +810,35 @@ class Analyze(Task):
             bb_rmsd = compute_rmsd(bb_native_coords, bb_coords)
             metrics["native_rmsd_all_bb"] = bb_rmsd.item()
 
-            metrics["native_rmsd"] = target_rmsd.item()
-            metrics["native_rmsd_bb"] = bb_target_rmsd.item()
+            if atom_target_resolved_mask.any() and native_atom_target_resolved_mask.any():
+                target_coords = feat["coords"][:, atom_target_resolved_mask]
+                native_target_coords = feat["native_coords"][
+                    :, native_atom_target_resolved_mask
+                ]
+                target_rmsd = compute_rmsd(native_target_coords, target_coords)
+
+                bb_target_coords = feat["coords"][
+                    :, atom_target_resolved_mask & feat["backbone_mask"].bool()
+                ]
+                bb_native_target_coords = feat["native_coords"][
+                    :,
+                    native_atom_target_resolved_mask
+                    & feat["native_backbone_mask"].bool(),
+                ]
+                bb_target_rmsd = compute_rmsd(
+                    bb_native_target_coords, bb_target_coords
+                )
+
+                metrics["native_rmsd"] = target_rmsd.item()
+                metrics["native_rmsd_bb"] = bb_target_rmsd.item()
+            else:
+                full_atom_mask = feat["atom_resolved_mask"].bool()
+                native_full_atom_mask = feat["native_atom_resolved_mask"].bool()
+                full_coords = feat["coords"][:, full_atom_mask]
+                native_full_coords = feat["native_coords"][:, native_full_atom_mask]
+                full_rmsd = compute_rmsd(native_full_coords, full_coords)
+                metrics["native_rmsd"] = full_rmsd.item()
+                metrics["native_rmsd_bb"] = bb_rmsd.item()
 
         # Check binding site adherence. For each binding site token, find closest design token
         binding_site_mask = feat["binding_type"] == 1
@@ -1142,7 +1154,7 @@ class Analyze(Task):
                 metrics["affinity_probability_binary1>75"] = (
                     metrics["affinity_probability_binary1"] > 0.75
                 )
-        
+
         for key in const.eval_keys_confidence:
             if key in feat:
                 if isinstance(feat[key], torch.Tensor) and feat[key].numel() == 1:
@@ -1320,7 +1332,7 @@ class Analyze(Task):
 
         if self.novelty_per_target_original:
             novelty_original_df["target_id"] = novelty_original_df["query"].apply(
-                lambda s: TARGET_ID_RE.match(s).group(1)
+                self.extract_target_id
             )
             nov_df = (
                 novelty_original_df.groupby("target_id")["novelty"].mean().reset_index()
@@ -1355,7 +1367,7 @@ class Analyze(Task):
 
         if self.novelty_per_target_refolded and (self.fold_metrics):
             novelty_refolded_df["target_id"] = novelty_refolded_df["query"].apply(
-                lambda s: TARGET_ID_RE.match(s).group(1)
+                self.extract_target_id
             )
             nov_df_refold = (
                 novelty_refolded_df.groupby("target_id")["novelty"].mean().reset_index()
@@ -1463,7 +1475,7 @@ class Analyze(Task):
                 histograms["hist" + col] = make_histogram(df, col)
 
         # make per target histograms
-        df["target_id"] = df["id"].apply(lambda s: TARGET_ID_RE.match(s).group(1))
+        df["target_id"] = df["id"].apply(self.extract_target_id)
         per_target_df = df.groupby("target_id").mean(numeric_only=True).reset_index()
         cols += ["rmsd<2.5", "designability_rmsd_2"]
         if self.compute_lddts:

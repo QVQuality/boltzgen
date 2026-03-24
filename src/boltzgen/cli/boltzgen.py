@@ -24,37 +24,40 @@ The possible tasks (and code files you want to inspect to understand what they a
     - Filter src/boltzgen/task/filter/filter.py (CPU: Very fast (20s) computes ranking and writes final output files)
 """
 
+from importlib.metadata import PackageNotFoundError, version as pkg_version
+from boltzgen.task.task import Task
+from boltzgen.task.predict.data_from_generated import DataConfig, FromGeneratedDataModule
+from boltzgen.task.analyze.analyze import Analyze
+from boltzgen.data.write.mmcif import to_mmcif
+from boltzgen.data.tokenize.tokenizer import Tokenizer
+from boltzgen.data.parse.schema import YamlDesignParser
+from boltzgen.data.mol import load_canonicals
+from boltzgen.data.feature.featurizer import Featurizer
+from boltzgen.data import const
+import torch
+import omegaconf
+import hydra
+import yaml
+from typing import Any, Dict, List, Tuple
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import sys
+import shutil
+import re
+import math
+import time
+import os
+import subprocess
+import shlex
+from dataclasses import dataclass
+import argparse
+import huggingface_hub
+import collections
 from boltzgen.utils.quiet import quiet_startup
 
 quiet_startup()
 
-import collections
-import huggingface_hub
-import argparse
-from dataclasses import dataclass
-import shlex
-import subprocess
-import os
-import time
-import math
-import re
-import shutil
-import sys
-import numpy as np
-import pandas as pd
-from pathlib import Path
-from typing import Any, Dict, List, Tuple
-import yaml
-import hydra
-import omegaconf
-import torch
-
-from boltzgen.data import const
-from boltzgen.data.mol import load_canonicals
-from boltzgen.data.parse.schema import YamlDesignParser
-from boltzgen.data.write.mmcif import to_mmcif
-from boltzgen.task.task import Task
-from importlib.metadata import PackageNotFoundError, version as pkg_version
 
 ### Paths and constants ####
 # Get the path to the project root (where main.py and configs/ are located)
@@ -526,12 +529,78 @@ def build_merge_parser(subparsers) -> argparse.ArgumentParser:
     return merge_parser
 
 
+def build_analyze_parser(subparsers) -> argparse.ArgumentParser:
+    analyze_parser = subparsers.add_parser(
+        "analyze",
+        description="Run BoltzGen analysis directly on one or more structure files",
+        help="Analyze arbitrary structure CIF/PDB files",
+    )
+    analyze_parser.add_argument(
+        "inputs",
+        nargs="+",
+        type=Path,
+        help="Structure file(s) or directory/directories containing structures to analyze",
+    )
+    analyze_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Output directory for staged inputs, metrics, and CSV files",
+    )
+    analyze_parser.add_argument(
+        "--native",
+        nargs="+",
+        type=Path,
+        help="Optional native/reference structure file(s) or directory/directories, matched by stem",
+    )
+    analyze_parser.add_argument(
+        "--design-chains",
+        nargs="+",
+        help="Chain ID(s) to treat as designed. Accepts space-separated values and/or comma-separated lists, e.g. --design-chains A B or --design-chains A,B",
+    )
+    analyze_parser.add_argument(
+        "--moldir",
+        type=str,
+        help="Path to the moldir. Default: %(default)s",
+        default=ARTIFACTS["moldir"][0],
+    )
+    analyze_parser.add_argument(
+        "--num-processes",
+        type=int,
+        default=1,
+        help="Number of CPU worker processes for analysis",
+    )
+    analyze_parser.add_argument(
+        "--sequence-recovery",
+        action="store_true",
+        help="If --native is provided, compute sequence recovery against the native structure",
+    )
+    analyze_parser.add_argument(
+        "--compute-lddts",
+        action="store_true",
+        help="Compute lDDT-based metrics where applicable",
+    )
+    analyze_parser.add_argument(
+        "--run-clustering",
+        action="store_true",
+        help="Run FoldSeek clustering on the analyzed structures",
+    )
+    analyze_parser.add_argument(
+        "--liability-analysis",
+        action="store_true",
+        help="Compute liability metrics on the designed chain sequence",
+    )
+    add_models_download_options(analyze_parser)
+    return analyze_parser
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="boltzgen",
         description="Boltzgen command line interface",
     )
     # Support: boltzgen -v / --version
+
     def get_package_version() -> str:
         try:
             return pkg_version("boltzgen")
@@ -551,7 +620,145 @@ def build_parser() -> argparse.ArgumentParser:
     build_download_parser(subparsers)
     build_check_parser(subparsers)
     build_merge_parser(subparsers)
+    build_analyze_parser(subparsers)
     return parser
+
+
+def _collect_structure_files(paths: list[Path]) -> list[Path]:
+    files: list[Path] = []
+    for path in paths:
+        if path.is_dir():
+            files.extend(
+                sorted(
+                    p
+                    for p in path.iterdir()
+                    if p.suffix.lower() in {".cif", ".pdb"}
+                    and not p.name.endswith("_native.cif")
+                )
+            )
+        else:
+            files.append(path)
+    return files
+
+
+def _collect_native_files(paths: list[Path]) -> dict[str, Path]:
+    native_map: dict[str, Path] = {}
+    for path in paths:
+        candidates = [path]
+        if path.is_dir():
+            candidates = sorted(
+                p for p in path.iterdir() if p.suffix.lower() in {".cif", ".pdb"}
+            )
+        for candidate in candidates:
+            stem = candidate.stem
+            if stem.endswith("_native"):
+                stem = stem[: -len("_native")]
+            native_map[stem] = candidate
+    return native_map
+
+
+def _link_or_copy(src: Path, dst: Path) -> None:
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    try:
+        dst.symlink_to(src.resolve())
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def _parse_chain_list(values: list[str] | None) -> list[str]:
+    if not values:
+        return []
+    chains: list[str] = []
+    for value in values:
+        chains.extend(part.strip() for part in value.split(",") if part.strip())
+    return chains
+
+
+def analyze_command(args: argparse.Namespace) -> None:
+    output_dir = args.output.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    moldir = get_artifact_path(args, args.moldir, repo_type="dataset")
+
+    input_files = _collect_structure_files(args.inputs)
+    if not input_files:
+        raise ValueError("No structure files found to analyze.")
+
+    stems = [path.stem for path in input_files]
+    if len(stems) != len(set(stems)):
+        raise ValueError(
+            "Input structure stems must be unique for standalone analysis."
+        )
+
+    native_map = _collect_native_files(args.native) if args.native else {}
+    design_chains = _parse_chain_list(args.design_chains)
+
+    for src in input_files:
+        staged_path = output_dir / src.name
+        _link_or_copy(src, staged_path)
+
+        if native_map:
+            native_src = native_map.get(src.stem)
+            if native_src is None and len(input_files) == 1 and len(native_map) == 1:
+                native_src = next(iter(native_map.values()))
+            if native_src is not None:
+                staged_native = output_dir / f"{src.stem}_native{native_src.suffix}"
+                _link_or_copy(native_src, staged_native)
+
+    data_cfg = DataConfig(
+        num_targets=10**12,
+        samples_per_target=10**15,
+        moldir=str(moldir),
+        tokenizer=Tokenizer(atomize_modified_residues=False),
+        featurizer=Featurizer(),
+        batch_size=1,
+        num_workers=0,
+        pin_memory=False,
+        target_id_regex=r"^(.*)$",
+        allow_missing_metadata=True,
+        standalone_design_chains=design_chains or None,
+    )
+    data = FromGeneratedDataModule(
+        cfg=data_cfg,
+        return_native=bool(args.native),
+        design_dir=str(output_dir),
+        fail_if_no_designs=True,
+    )
+
+    task = Analyze(
+        name="analyze",
+        data=data,
+        design_dir=str(output_dir),
+        num_processes=args.num_processes,
+        backbone_fold_metrics=False,
+        allatom_fold_metrics=False,
+        affinity_metrics=False,
+        noncovalents_original=bool(design_chains),
+        noncovalents_refolded=False,
+        diversity_original=False,
+        diversity_refolded=False,
+        diversity_per_target_original=False,
+        diversity_per_target_refolded=False,
+        novelty_original=False,
+        novelty_refolded=False,
+        novelty_per_target_original=False,
+        novelty_per_target_refolded=False,
+        delta_sasa_original=bool(design_chains),
+        delta_sasa_refolded=False,
+        largest_hydrophobic=False,
+        largest_hydrophobic_refolded=False,
+        compute_lddts=args.compute_lddts,
+        run_clustering=args.run_clustering,
+        native=bool(args.native),
+        sequence_recovery=args.sequence_recovery,
+        liability_analysis=args.liability_analysis,
+    )
+    task.run()
+    print(
+        f"Standalone analysis complete. CSV: {output_dir / 'aggregate_metrics_analyze.csv'}"
+    )
+    if design_chains:
+        print(f"Designed chains used for analysis: {', '.join(design_chains)}")
 
 
 #### Commands ####
@@ -1292,11 +1499,11 @@ def check_design_spec(
     extract_mask = np.zeros(len(structure.residues), dtype=bool)
     for i, residue in enumerate(structure.residues):
         structure.atoms["bfactor"][
-            residue["atom_idx"] : residue["atom_idx"] + residue["atom_num"]
+            residue["atom_idx"]: residue["atom_idx"] + residue["atom_num"]
         ] = 100 * design_info.res_design_mask[i] + 80 * design_info.res_binding_type[i]
 
         atom_positions = structure.atoms["coords"][
-            residue["atom_idx"] : residue["atom_idx"] + residue["atom_num"]
+            residue["atom_idx"]: residue["atom_idx"] + residue["atom_num"]
         ]
         zero_position_count = ((atom_positions**2).sum(axis=1) < 1e-6).sum()
         if not zero_position_count == len(atom_positions):
@@ -1619,7 +1826,6 @@ def merge_command(args: argparse.Namespace) -> None:
 
         return merged_count
 
-
     def _copy_design_files(
         src_dir: Path,
         dest_dir: Path,
@@ -1657,17 +1863,14 @@ def merge_command(args: argparse.Namespace) -> None:
                 required=False,
             )
 
-
     def _make_new_file_name(original_file: str, new_id: str) -> str:
         path = Path(original_file)
         suffix = "".join(path.suffixes)
         return f"{new_id}{suffix}" if suffix else new_id
 
-
     def _slugify_run_tag(path: Path, index: int) -> str:
         slug = re.sub(r"[^0-9A-Za-z]+", "-", path.name).strip("-").lower()
         return slug or f"run{index}"
-
 
     def _copy_path(src: Path, dst: Path, *, required: bool) -> None:
         if src.exists():
@@ -1745,6 +1948,8 @@ def main() -> None:
         check_command(args)
     elif args.command == "merge":
         merge_command(args)
+    elif args.command == "analyze":
+        analyze_command(args)
     else:
         parser.print_help()
 

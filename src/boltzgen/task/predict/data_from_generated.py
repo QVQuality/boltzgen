@@ -62,6 +62,8 @@ class DataConfig:
     design_mask_override: Optional[str] = None
     multiplicity: int = 1
     return_designfolding: bool = False
+    allow_missing_metadata: bool = False
+    standalone_design_chains: Optional[List[str]] = None
 
 
 def collate(data: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
@@ -214,6 +216,7 @@ class FromGeneratedDataset(torch.utils.data.Dataset):
         use_new_design_mask: bool = False,
         multiplicity: int = 1,
         return_designfolding=False,
+        standalone_design_chains: Optional[List[str]] = None,
     ) -> None:
         """
         Parameters
@@ -251,6 +254,8 @@ class FromGeneratedDataset(torch.utils.data.Dataset):
         self.use_new_design_mask = use_new_design_mask
         self.multiplicity = multiplicity
         self.return_designfolding = return_designfolding
+        self.allow_missing_metadata = False
+        self.standalone_design_chains = standalone_design_chains
 
     def __getitem__(self, idx: int) -> Dict:
         """Get an item from the dataset.
@@ -301,7 +306,16 @@ class FromGeneratedDataset(torch.utils.data.Dataset):
 
         if self.reference_metadata_dir:
             reference_metadata_path = self.reference_metadata_dir / metadata_path.name
-            metadata = np.load(reference_metadata_path)
+            if reference_metadata_path.exists():
+                metadata = np.load(reference_metadata_path)
+            elif self.allow_missing_metadata:
+                metadata = self._build_default_metadata(generated_path)
+            else:
+                metadata = np.load(reference_metadata_path)
+        elif metadata_path.exists():
+            metadata = np.load(metadata_path)
+        elif self.allow_missing_metadata:
+            metadata = self._build_default_metadata(generated_path)
         else:
             metadata = np.load(metadata_path)
 
@@ -354,6 +368,76 @@ class FromGeneratedDataset(torch.utils.data.Dataset):
                 feat[f"native_{k}"] = v
 
         return feat
+
+    def _build_default_metadata(self, generated_path: Path) -> Dict[str, np.ndarray]:
+        """Build minimal metadata for standalone analysis of arbitrary structures."""
+        mols = {}
+        if self.extra_mol_dir is not None:
+            mols = {
+                path.stem: pickle.load(path.open("rb"))
+                for path in self.extra_mol_dir.glob("*.pkl")
+            }
+            for mol in mols.values():
+                element_counts = defaultdict(int)
+                for atom in mol.GetAtoms():
+                    symbol = atom.GetSymbol()
+                    element_counts[symbol] += 1
+                    atom_name = f"{symbol}{element_counts[symbol]}"
+                    atom.SetProp("name", atom_name)
+
+        try:
+            if generated_path.suffix == ".cif":
+                structure = mmcif.parse_mmcif(
+                    generated_path,
+                    mols,
+                    moldir=self.moldir,
+                    use_original_res_idx=False,
+                ).data
+            elif generated_path.suffix == ".pdb":
+                structure = parse_pdb(
+                    generated_path,
+                    moldir=self.moldir,
+                    use_original_res_idx=False,
+                ).data
+            else:
+                raise ValueError(f"Invalid path:{generated_path}")
+        except Exception as e:
+            print(f"Failed to parse {generated_path} with error {e}. Skipping.")
+            raise DataFetchException() from e
+
+        try:
+            tokenized = self.tokenizer.tokenize(
+                structure, inverse_fold=self.inverse_fold
+            )
+        except Exception as e:
+            print(f"Tokenizer failed on {generated_path} with error {e}. Skipping.")
+            raise DataFetchException() from e
+
+        design_chains = self.standalone_design_chains
+        if design_chains:
+            chain_names = {
+                str(tokenized.structure.chains[token["asym_id"]]["name"])
+                for token in tokenized.tokens
+            }
+            missing = sorted(set(design_chains) - chain_names)
+            if missing:
+                msg = (
+                    f"Designed chain(s) not found in {generated_path.name}: {missing}. "
+                    f"Available chains: {sorted(chain_names)}"
+                )
+                raise ValueError(msg)
+
+            design_mask = np.array(
+                [
+                    str(tokenized.structure.chains[token["asym_id"]]["name"])
+                    in set(design_chains)
+                    for token in tokenized.tokens
+                ],
+                dtype=bool,
+            )
+        else:
+            design_mask = np.ones(len(tokenized.tokens), dtype=bool)
+        return {"design_mask": design_mask}
 
     def get_feat(self, path, design_mask, ss_type=None, binding_type=None, aa_constraint_mask=None):
         # Load design
@@ -584,6 +668,7 @@ class FromGeneratedDataModule(pl.LightningDataModule):
         self.target_templates = target_templates
         self.design_mask_templates = design_mask_templates
         self.extra_features = extra_features
+        self.allow_missing_metadata = cfg.allow_missing_metadata
         self.disulfide_prob = cfg.disulfide_prob
         self.disulfide_on = cfg.disulfide_on
         self.design_mask_override = cfg.design_mask_override
@@ -628,7 +713,9 @@ class FromGeneratedDataModule(pl.LightningDataModule):
                 use_new_design_mask=use_new_design_mask,
                 multiplicity=self.cfg.multiplicity,
                 return_designfolding=self.cfg.return_designfolding,
+                standalone_design_chains=self.cfg.standalone_design_chains,
             )
+            self.predict_set.allow_missing_metadata = self.allow_missing_metadata
 
     def init_dataset(
         self,
@@ -837,7 +924,9 @@ class FromGeneratedDataModule(pl.LightningDataModule):
             use_new_design_mask=use_new_design_mask,
             multiplicity=self.cfg.multiplicity,
             return_designfolding=self.cfg.return_designfolding,
+            standalone_design_chains=self.cfg.standalone_design_chains,
         )
+        self.predict_set.allow_missing_metadata = self.allow_missing_metadata
 
     def predict_dataloader(self) -> DataLoader:
         return DataLoader(
