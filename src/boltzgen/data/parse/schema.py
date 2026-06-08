@@ -674,13 +674,17 @@ def parse_range(ranges, c_start=0, c_end=None):
             start -= 1
             end = c_end - c_start
             indices += list(range(c_start + start, c_end))
-    if start < 0:
-        msg = f"There is a 0 in the specified range(s) {ranges}. Residue indices are 1 indexed."
-        raise ValueError(msg)
+        else:
+            msg = f"Malformed residue range specification '{spec}' in '{ranges}'."
+            raise ValueError(msg)
 
-    if c_end is not None and end > c_end - c_start:
-        msg = f"Specified end {ranges} is higher than the length of the chain."
-        raise ValueError(msg)
+        if start < 0:
+            msg = f"There is a 0 in the specified range(s) {ranges}. Residue indices are 1 indexed."
+            raise ValueError(msg)
+
+        if c_end is not None and end > c_end - c_start:
+            msg = f"Specified end {ranges} is higher than the length of the chain."
+            raise ValueError(msg)
     return indices
 
 
@@ -2197,6 +2201,13 @@ class YamlDesignParser:
                 c_end = c_start + data_chain["res_num"].item()
 
                 # Set values
+                if "binding" in chain:
+                    binding = chain["binding"]
+                    if binding == "all":
+                        fbind_types[c_start:c_end] = const.binding_type_ids["BINDING"]
+                    else:
+                        indices = parse_range(binding, c_start, c_end)
+                        fbind_types[indices] = const.binding_type_ids["BINDING"]
                 if "not_binding" in chain:
                     not_binding = chain["not_binding"]
                     if not_binding == "all":
@@ -2206,13 +2217,6 @@ class YamlDesignParser:
                     else:
                         indices = parse_range(not_binding, c_start, c_end)
                         fbind_types[indices] = const.binding_type_ids["NOT_BINDING"]
-                elif "binding" in chain:
-                    binding = chain["binding"]
-                    if binding == "all":
-                        fbind_types[c_start:c_end] = const.binding_type_ids["BINDING"]
-                    else:
-                        indices = parse_range(binding, c_start, c_end)
-                        fbind_types[indices] = const.binding_type_ids["BINDING"]
 
         # Get file's secondary structure types called fss_types
         fss_type = np.ones(num_res) * const.ss_type_ids["UNSPECIFIED"]
