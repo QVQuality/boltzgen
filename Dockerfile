@@ -50,6 +50,8 @@ RUN mkdir -p "${HF_HOME}" && \
         boltzgen download all --cache "${HF_HOME}" --force_download; \
     fi
 
+RUN pip install --no-cache-dir "fastapi[standard]"
+
 ARG USERNAME=boltzgen
 ARG USER_UID=1000
 ARG USER_GID=1000
@@ -59,5 +61,12 @@ RUN groupadd --gid ${USER_GID} ${USERNAME} && \
 
 RUN mkdir -p "${HF_HOME}" && chown -R ${USER_UID}:${USER_GID} "${HF_HOME}"
 
+COPY api /api
+
 USER ${USERNAME}
 WORKDIR /workspace
+
+EXPOSE 8000
+# --app-dir /: the API lives at /api, while the working directory is the mounted
+# outputs volume, so the module is not importable from there.
+CMD ["uvicorn", "api.main:app", "--app-dir", "/", "--host", "0.0.0.0", "--port", "8000"]
