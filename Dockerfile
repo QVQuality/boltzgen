@@ -9,7 +9,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu121 \
     HF_HOME=/cache
-    
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     software-properties-common \
@@ -41,6 +41,9 @@ RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 &
 WORKDIR /app
 
 COPY . /app
+
+RUN pip install --no-cache-dir torch==2.11.0 \
+    --index-url https://download.pytorch.org/whl/cu128
 
 RUN pip install --no-cache-dir -e /app
 
